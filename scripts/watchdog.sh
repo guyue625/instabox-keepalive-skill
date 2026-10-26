@@ -6,6 +6,14 @@
 set -u
 SERVICES=()   # 改成你的服务名，例如 SERVICES=(sing-box myapp)
 
+if [ "${#SERVICES[@]}" -eq 0 ]; then
+  # 没填服务时只刷活跃——在输出里明确写一行，避免误以为看门狗在守护服务。
+  # tick 只看退出码：这里仍退出 0，不触发无意义的每分钟重试。
+  echo "watchdog: SERVICES 为空，未检查任何服务（只刷活跃）。要守护服务请编辑 /data/watchdog.sh 的 SERVICES。"
+  date
+  exit 0
+fi
+
 rc=0
 for s in "${SERVICES[@]}"; do
   systemctl is-active --quiet "$s" && continue
