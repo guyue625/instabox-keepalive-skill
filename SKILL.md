@@ -1,5 +1,7 @@
 # InstaBox 保活（零 token 纯脚本方案）
 
+> Fork 修复版（2026-10-26）：修了忙循环（空账号/凭证错误/读列表失败也要写 60 秒兜底 `next_wake`，loop 睡眠下限 5 秒、无有效到期默认睡 60 秒）、去掉默认占位凭证、生命周期 `Idempotency-Key` 按逻辑操作复用、`wait_state` 抗单次查询失败、tick 期间每 30 秒续写心跳、`ib_api` 可离线 import 并新增 `tests/` 单测。详见 README 开头的 fork 修复说明。其余方法与时间设定与上游一致。
+
 ## Purpose
 
 给 InstaBox 机器做保活，三层：
@@ -40,7 +42,7 @@
 - `scripts/instabox_tick.py`：保活一拍。读时间记录文件 `machines.json`（按账号分组、按机器名记录，每台只留最近一次：本轮开始运行时间 run0、上次 exec、下次到期 next，时间都是带时区的可读格式；加文件锁，手动 --now 和 loop 同时跑不会互相覆盖），全部没到期直接退出；到期就列出全部机器，由纯函数 `decide()` 决定 exec、轮换、唤醒或等待。`--now` 立刻全量巡检，可当手动唤醒用。
 - `scripts/watchdog.sh`：放进每台机器的 `/data/watchdog.sh`。外部 tick 每 10 分钟和每次开机后用 exec 以 sudo 调它，逐个检查 `SERVICES` 里的 systemd 服务，没起来就 start；没有这个文件时 exec 退回跑 `date`。
 - `scripts/loop.sh`：常驻 loop，给 `CREDS` 里每个账号跑一拍，写心跳，再睡到 next_wake（最多 60 秒）；只有动作和错误才写日志。
-- `scripts/keepalive.sh`：自查自拉。判断标准：pidfile 存在、`proc` cmdline 含 loop.sh 绝对路径、心跳 20 分钟内新鲜（loop 在每个账号前都写一次心跳）。
+- `scripts/keepalive.sh`：自查自拉。判断标准：pidfile 存在、`proc` cmdline 含 loop.sh 绝对路径、心跳 20 分钟内新鲜（loop 在每个账号前写一次心跳，fork 版在 tick 运行期间另有子进程每 30 秒续写，避免多台机器串行处理时心跳变旧被误判）。
 - `scripts/instabox-loop-watch.sh`：hook 轮询脚本，每 300 秒跑一次 keepalive.sh，只在自动恢复失败时 wake agent。
 - 轮换为什么成立（2026-10-25 实测）：冷却 409 只在连续运行满 8 小时被强制暂停时出现，手动 suspend 后 10 秒就能 resume；一台机器被强制暂停、冷却结束被拉回后，runStartedAt 就刷新成拉回的时刻，平台按 resume 时刻重新计时。机器内 reboot 没用，平台视角 VM 没停过，runStartedAt 不刷新。
 - 运行时长 run0：第一次见到机器时取平台的 `runStartedAt`；之后每次从暂停回到运行，取 `runStartedAt` 和当前时间中较晚的那个，防止平台没刷新计时导致反复轮换。
@@ -80,7 +82,9 @@
 - 拉起 loop 时必须加 `9>&-` 关掉继承的 flock 锁 fd，否则 loop 活着时锁永不释放，loop 死后它残留的 sleep 子进程还会继续握着锁，导致下次 keepalive 拿不到锁直接失败。
 - 判活必须用 `proc` cmdline 含 loop.sh 绝对路径加心跳新鲜度，不能只看 pidfile，否则会漏判成已死而拉起僵尸双实例。
 - 绝不用 pkill 加 f 盲杀，只杀 cmdline 能对上的旧 loop。pgrep 加 f 会匹配到执行命令的 shell 自身，查存活时必须排除自匹配。
-- 写操作（suspend、resume、start、stop、建机、删机）要带 Idempotency-Key（UUID），重试同一个 key 不会重复执行。exec 和读操作不用带。
+- 写操作（suspend、resume、start、stop、建机、删机）要带 Idempotency-Key（UUID），重试同一个 key 不会重复执行。exec 和读操作不用带。注意（fork 已修）：key 必须按逻辑操作复用——tick 把 key 存在 `machines.json` 的 `pendingKey:<动作>` 里、成功后才清除；每次调用都新生成 key 的话，应用层重试等于换了新操作，去重不成立。
+- `next_wake` 绝不能留空或写过去的时间（fork 已修）：无机器、凭证错误、读列表失败时 tick 写 now+60 秒兜底，loop 无有效到期时默认睡 60 秒、睡眠下限 5 秒。原版在这几种情况下会让 loop 每 1 秒空转打 API。
+- `loop.sh` 默认 `CREDS` 只有一个示例凭证（fork 已改）：不要照抄带占位账号的数组，没注册的凭证名会每轮报错并刷满日志。
 - 凭证 401 或 403 时先确认请求真的带上了 credential，不用 surrogate helper 的请求等于没带凭证，再怀疑 Key 本身。
 - VM 重启或替换会杀掉 loop，hook 在 5 分钟内发现并重启；状态文件在磁盘上，重启后接着算。
 - InstaBox 条款禁 open proxy 和 public VPN exit，跑这类服务有封号风险，部署前先确认用途合规。
@@ -93,3 +97,4 @@
 - `scripts/watchdog.sh`：机器内看门狗。
 - `scripts/keepalive.sh`：自查自拉。
 - `scripts/instabox-loop-watch.sh`：hook 轮询脚本。
+- `tests/test_decide.py`：离线单测 21 个（仓库根目录 `python3 -m unittest discover -s tests -v`），改 tick 逻辑后先跑它。

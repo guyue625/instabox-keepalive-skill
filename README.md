@@ -4,6 +4,16 @@
 
 本仓库是给人看的说明；给 AI agent 执行的完整规范在 [`SKILL.md`](SKILL.md) 里（方法、时间设定依据、已验证事实、排障铁律）。
 
+> **本 fork 的修复（2026-10-26，相对上游 `caichengle666/instabox-keepalive-skill`）**
+>
+> 1. **修忙循环**：原版在账号下无机器、凭证错误或读机器列表失败时不写 `next_wake`（或写空），loop 会每 1 秒空转重试、反复调 API。现在这些情况统一写 60 秒兜底唤醒时间；`loop.sh` 同时把睡眠下限抬到 5 秒、无有效到期时间时默认睡 60 秒。
+> 2. **去掉占位凭证**：`loop.sh` 默认 `CREDS` 只留一个示例，不再带着 `custom.instabox-another-account` 占位账号每轮报错。多账号自己往括号里加。
+> 3. **幂等键真正复用**：原版每次调用都新生成 `Idempotency-Key`，应用层重试根本去重不了。现在 key 按逻辑操作存在 `machines.json` 的 `pendingKey:<动作>` 里，同一操作重试传同一个 key，成功后清除。
+> 4. **轮换抗抖动**：`wait_state` 单次查询失败不再中断整个轮换，继续轮询到超时；`ib_api` 的网络错误（URLError）统一转成 `ApiError`。
+> 5. **心跳续写**：tick 运行期间每 30 秒续写一次 heartbeat，避免单账号多台机器串行处理时间长时被 `keepalive.sh` 误判死亡。
+> 6. **可测性**：`ib_api` 找不到 `dynamic_credentials` 时延迟到真正调 API 才报错（路径可用 `IB_CREDENTIALS_BIN` 覆盖），并新增 `tests/test_decide.py` 离线单测 21 个（`decide()`、幂等键复用、`next_wake` 兜底等）：仓库根目录跑 `python3 -m unittest discover -s tests -v`。
+> 7. **看门狗不静默**：`watchdog.sh` 的 `SERVICES` 为空时会明确输出一行说明只刷活跃、不检查服务。
+
 ## 要解决的问题：免费档的两个限制
 
 | 限制 | 说明 |
@@ -41,7 +51,7 @@
 前置条件：每个 InstaBox 账号在 Muse 的 Secure Vault 里注册一个 API 连接（`api_key`，放在 `X-API-Key` 请求头，`api_hosts` 为 `api.instabox.sh`），记下凭证名。**API Key 绝不写进任何文件、日志或聊天记录**，脚本通过保险库的 surrogate（替身凭证）机制调用。
 
 1. 把 `scripts/` 里的 `ib_api.py`、`instabox_tick.py`、`loop.sh`、`keepalive.sh` 放进保活目录（默认 `~/workspace/instabox-keepalive`，两个 `.py` 必须同目录）；把 `instabox-loop-watch.sh` 放进 hooks 脚本目录并挂上 hook（poll 300 秒）。
-2. 改 `loop.sh` 里的 `CREDS`：每个账号填一个凭证名，例如 `CREDS=(custom.instabox custom.instabox-another-account)`。
+2. 改 `loop.sh` 里的 `CREDS`：默认只有一个示例 `CREDS=(custom.instabox)`，改成你自己的凭证名；多账号继续往括号里加，例如 `CREDS=(custom.instabox custom.instabox-work)`。不要留没注册过的占位凭证名——会每轮报凭证错误（新版虽有 60 秒兜底不会忙循环，但日志会被刷满）。
 3. （可选）把 `watchdog.sh` 放进每台机器的 `/data/watchdog.sh`，`chmod +x`，并在文件里的 `SERVICES` 填要守护的 systemd 服务名（机器里需要免密 sudo）。
 4. 用**绝对路径**启动：`bash ~/workspace/instabox-keepalive/keepalive.sh`（判活靠进程命令行里的绝对路径，所以必须这样启动）。
 5. 启动后检查：`loop.pid` 对应的进程活着、心跳每分钟在刷新、`machines.json` 已生成且每台机器的 `run0`（运行起点）和 `next`（下次到期）合理。
@@ -71,10 +81,11 @@
 - `scripts/keepalive.sh`：自查自拉 loop。
 - `scripts/instabox-loop-watch.sh`：hook 轮询脚本，只在自愈失败时 wake agent。
 - `scripts/watchdog.sh`：放进机器 `/data/watchdog.sh` 的看门狗模板。
+- `tests/test_decide.py`：离线单测（不需要凭证、不调 API），覆盖 `decide()`、幂等键复用和 `next_wake` 兜底。
 
 ## 注意事项
 
 - 不要用 `pkill -f` 之类按命令行模糊杀进程（会匹配到执行命令的 shell 自身）；只按 pid + `/proc/<pid>/cmdline` 核对后精确停。拉起 loop 时要关掉继承的 flock 锁句柄（`keepalive.sh` 已处理），否则锁会被残留子进程握住、自愈失效。细节见 `SKILL.md` 的 Pitfalls。
-- 写操作（suspend / resume / start / stop / 创建 / 删除）都要带 `Idempotency-Key`，重试同一个 key 不会重复执行。
+- 写操作（suspend / resume / start / stop / 创建 / 删除）都要带 `Idempotency-Key`。本 fork 的 tick 会把同一次逻辑操作的 key 存进 `machines.json` 并在重试时复用（成功后清除），服务端才会真的按 key 去重；自己写调用代码时也要遵守同一原则，不要每次重试都换新 key。
 - 在机器上跑什么服务请自行遵守 InstaBox 的服务条款（例如其条款禁止 open proxy / 公共 VPN 出口）。
 - 本方案只用平台公开 API 和免费档规则本身：防睡靠真实 exec，提前轮换用的是正常的手动暂停 / 恢复语义。
